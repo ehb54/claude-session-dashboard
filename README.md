@@ -13,14 +13,14 @@ last. This pane answers that.
 ## What the pane shows
 
 ```
-[Sort: your last touch] [Show archived] [Refresh] [Pop out]
+[Sort: your last touch] [Show archived] [Show hidden (2)] [Refresh] [Pop out]
 Within [1d] [1w] [1M] [all]  [or type 30m, 6h, 2w, 3M] [Set]
 [Filter by title or group]
-12 of 275 sessions within 1 day · scanned just now · ● running
+12 of 275 sessions within 1 day · 2 hidden · scanned just now · ● running
 ● Build the release scripts
-    infra · you 3m · any 1m
+    infra · you 3m · any 1m  hide
   Review the parser change
-    no group · you 2h · any 5h
+    no group · you 2h · any 5h  hide
 ```
 
 - **One row per session**: title (● when it is running), then its sidebar
@@ -37,7 +37,11 @@ Within [1d] [1w] [1M] [all]  [or type 30m, 6h, 2w, 3M] [Set]
   cutoff set, a session with no time at all (never opened, never prompted)
   shows only under **all**.
 - **Filter** keeps rows whose title or group contains every word you type.
+- **hide** on a row takes that session off the list. **Show hidden (N)** brings
+  hidden sessions back, marked "(hidden)", each with **unhide**.
 - **Show archived** adds archived sessions.
+- Your sort, cutoff and hidden sessions are remembered: a dashboard in any
+  session starts with the choices you made last.
 - **Click a row** to open that session in the main window. The first time,
   the dashboard's own session moves into a pop-out window so the list stays
   visible; **Pop out** does that by itself.
@@ -79,7 +83,9 @@ never opens the pane and never scans.
 
 ## What it reads
 
-Everything stays on your machine, and the mod writes nothing. It reads:
+Everything stays on your machine. The only thing the mod writes is its own
+small store in Claude Code (your sort, cutoff and hidden session ids). It
+reads:
 
 - **The desktop app's own session tools** (the `ccd_session_mgmt`,
   `ccd_sidebar` and `ccd_window` servers the app provides to its sessions):
@@ -122,7 +128,8 @@ claude plugin test .
 
 The tests run the pane on the desktop and terminal surfaces against a fake
 app: sorting both ways, the cutoff presets and typed values, the filter, the
-pop-out before the first open, and the fallback when the app's lookups fail.
+pop-out before the first open, hiding and unhiding, choices saved and restored
+across sessions, and the fallback when the app's lookups fail.
 
 ## License
 

@@ -51,6 +51,8 @@ const rowsAtom = atom({ plugin: 'session-dashboard', key: 'rows' } as const, [] 
 const sortAtom = atom({ plugin: 'session-dashboard', key: 'sort' } as const, 'touch' as SortKey)
 const cutoffAtom = atom({ plugin: 'session-dashboard', key: 'cutoff' } as const, '1d')
 const archivedAtom = atom({ plugin: 'session-dashboard', key: 'archived' } as const, false)
+const hiddenAtom = atom({ plugin: 'session-dashboard', key: 'hidden' } as const, [] as string[])
+const showHiddenAtom = atom({ plugin: 'session-dashboard', key: 'showHidden' } as const, false)
 const filterAtom = atom({ plugin: 'session-dashboard', key: 'filter' } as const, '')
 const statusAtom = atom(
   { plugin: 'session-dashboard', key: 'status' } as const,
@@ -401,6 +403,57 @@ async function openSession($: Engine, row: Row): Promise<void> {
   }
 }
 
+/** Store keys, kept across sessions: the sort and cutoff chosen, and the sessions hidden. */
+const PREFS = 'prefs'
+const HIDDEN = 'hidden'
+
+/** Puts back what the person chose last, in any session: sort, cutoff, hidden sessions. */
+async function loadPrefs($: Engine): Promise<void> {
+  try {
+    const saved = (await $.store.get(PREFS)) as { sort?: unknown; cutoff?: unknown } | undefined
+    const sort = saved?.sort
+    if (sort === 'touch' || sort === 'activity') await update($, sortAtom, () => sort)
+    const cut = typeof saved?.cutoff === 'string' ? parseCutoff(saved.cutoff) : null
+    if (cut !== null) await update($, cutoffAtom, () => cut.spec)
+  } catch {
+    // Nothing saved, or the store is unreadable: the defaults stand.
+  }
+  try {
+    const hidden = await $.store.get(HIDDEN)
+    if (Array.isArray(hidden)) {
+      const ids = hidden.filter((id): id is string => typeof id === 'string')
+      await update($, hiddenAtom, () => ids)
+    }
+  } catch {
+    // Nothing hidden yet.
+  }
+}
+
+/** Hides a session from the list, or shows it again, and remembers that. */
+async function setHidden($: Engine, id: string, hide: boolean): Promise<void> {
+  await update($, hiddenAtom, ids =>
+    hide ? [...new Set([...ids, id])] : ids.filter(one => one !== id),
+  )
+  try {
+    await $.store.set(HIDDEN, await read($, hiddenAtom))
+  } catch {
+    // It still holds for this session.
+  }
+}
+
+async function savePrefs($: Engine): Promise<void> {
+  try {
+    await $.store.set(PREFS, { sort: await read($, sortAtom), cutoff: await read($, cutoffAtom) })
+  } catch {
+    // The choice still holds for this session.
+  }
+}
+
+async function toggleSort($: Engine): Promise<void> {
+  await update($, sortAtom, now => (now === 'touch' ? 'activity' : 'touch'))
+  await savePrefs($)
+}
+
 /** Sets the cutoff from a preset or what the person typed. */
 async function setCutoff($: Engine, text: string): Promise<void> {
   const cut = parseCutoff(text)
@@ -409,6 +462,7 @@ async function setCutoff($: Engine, text: string): Promise<void> {
     return
   }
   await update($, cutoffAtom, () => cut.spec)
+  await savePrefs($)
 }
 
 const isOpen = async ($: Engine): Promise<boolean> =>
@@ -420,6 +474,7 @@ export const register: Register = on => {
       name: 'session-dashboard',
       description: 'Open a pane of all sessions, across groups, by your last touch',
     })
+    await loadPrefs($)
     // Scans run only while the pane is open, so a session without it costs nothing.
     $.clock.every(REFRESH_MS, async () => {
       if (await isOpen($)) await refresh($)
@@ -445,13 +500,17 @@ export const register: Register = on => {
     const status = await read($, statusAtom)
     const cut = parseCutoff(await read($, cutoffAtom)) ?? parseCutoff('1d')!
     const isPreset = (CUTOFF_PRESETS as readonly string[]).includes(cut.spec)
+    const hidden = new Set(await read($, hiddenAtom))
+    const showHidden = await read($, showHiddenAtom)
+    const hiddenCount = rows.filter(row => hidden.has(row.id)).length
     const now = await $.clock.now()
-    const shown = sortRows(withinCutoff(filterRows(rows, filter), sort, cut.ms, now), sort)
+    const visible = filterRows(rows, filter).filter(row => showHidden || !hidden.has(row.id))
+    const shown = sortRows(withinCutoff(visible, sort, cut.ms, now), sort)
     const age = status.updatedAt === null ? null : ago(status.updatedAt, now)
     const head =
       age === null
         ? 'Scanning sessions…'
-        : `${shown.length} of ${rows.length} sessions${cut.ms === null ? '' : ` within ${cut.label}`} · scanned ${age === 'now' ? 'just now' : `${age} ago`} · ● running`
+        : `${shown.length} of ${rows.length} sessions${cut.ms === null ? '' : ` within ${cut.label}`}${hiddenCount > 0 ? ` · ${hiddenCount} hidden` : ''} · scanned ${age === 'now' ? 'just now' : `${age} ago`} · ● running`
 
     return (
       <Box flexDirection="column">
@@ -459,12 +518,17 @@ export const register: Register = on => {
           <Button
             key="sort"
             label={sort === 'touch' ? 'Sort: your last touch' : 'Sort: last activity'}
-            onPress={() => void update($, sortAtom, now => (now === 'touch' ? 'activity' : 'touch'))}
+            onPress={() => void toggleSort($)}
           />
           <Button
             key="archived"
             label={archived ? 'Hide archived' : 'Show archived'}
             onPress={() => void update($, archivedAtom, now => !now).then(() => refresh($))}
+          />
+          <Button
+            key="show-hidden"
+            label={showHidden ? 'Hide hidden' : `Show hidden (${hiddenCount})`}
+            onPress={() => void update($, showHiddenAtom, now => !now)}
           />
           <Button key="refresh" label="Refresh" onPress={() => void refresh($)} />
           {status.poppedOut !== true && (
@@ -501,16 +565,29 @@ export const register: Register = on => {
           <Text dimColor>Opening a session first moves this list into its own window, so it stays in view.</Text>
         )}
         {status.error !== null && <Text color="warning">{status.error}</Text>}
-        {shown.map(row => (
-          <Box key={`row-${row.id}`} flexDirection="column">
-            <Button key={row.id} plain onPress={() => void openSession($, row)}>
-              {`${row.isRunning ? '● ' : '  '}${row.title}${row.isSelf ? ' (this session)' : ''}${row.isArchived ? ' (archived)' : ''}`}
-            </Button>
-            <Text dimColor wrap="truncate-end">
-              {`    ${row.group ?? 'no group'} · you ${ago(touchAt(row), now)} · any ${ago(row.activityAt, now)}`}
-            </Text>
-          </Box>
-        ))}
+        {shown.map(row => {
+          const isHidden = hidden.has(row.id)
+
+          return (
+            <Box key={`row-${row.id}`} flexDirection="column">
+              <Button key={row.id} plain onPress={() => void openSession($, row)}>
+                {`${row.isRunning ? '● ' : '  '}${row.title}${row.isSelf ? ' (this session)' : ''}${row.isArchived ? ' (archived)' : ''}${isHidden ? ' (hidden)' : ''}`}
+              </Button>
+              <Box flexDirection="row" columnGap={1}>
+                <Text dimColor wrap="truncate-end">
+                  {`    ${row.group ?? 'no group'} · you ${ago(touchAt(row), now)} · any ${ago(row.activityAt, now)}`}
+                </Text>
+                <Button
+                  key={`hide-${row.id}`}
+                  plain
+                  dimColor
+                  label={isHidden ? 'unhide' : 'hide'}
+                  onPress={() => void setHidden($, row.id, !isHidden)}
+                />
+              </Box>
+            </Box>
+          )
+        })}
       </Box>
     )
   })

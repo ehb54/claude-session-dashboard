@@ -317,3 +317,111 @@ test('helpers', async () => {
   expect(ago(NOW - 3 * 60 * MIN, NOW)).toBe('3h')
   expect(ago(NOW - 3 * DAY, NOW)).toBe('3d')
 })
+
+/** Answers every app lookup with an empty list: rows then come from the index alone. */
+const quietApp = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  on('mcp.call', () => ({ value: { content: [{ type: 'text', text: '[]' }], isError: false } }))
+  on('process.run', () => ({ value: { exitCode: 127, stdout: '', stderr: '' } }))
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.toast', () => ({ value: undefined }))
+}
+
+/** A store in memory the test can read: what the mod saved across sessions. */
+const fakeStore = (on: Parameters<Parameters<typeof test>[1]>[1], saved: Record<string, unknown>) => {
+  on('store.get', (_, e) => ({ value: saved[e.key] }))
+  on('store.set', (_, e) => {
+    saved[e.key] = e.value
+
+    return { value: undefined }
+  })
+}
+
+const startSession = async ($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  on('command.register', () => ({ value: { command: 'session-dashboard' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+}
+
+test('the sort, cutoff and hidden sessions chosen last come back in a new session', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME })
+  fakeFiles(on)
+  quietApp(on)
+  const saved: Record<string, unknown> = {
+    prefs: { sort: 'activity', cutoff: '3d' },
+    hidden: ['local_c'],
+  }
+  fakeStore(on, saved)
+  await startSession($, on)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  expect((await ui.find({ key: 'sort' }))?.props.label).toBe('Sort: last activity')
+  expect((await ui.find({ key: 'cutoff' }))?.props.value).toBe('3d')
+  expect(await ui.find({ type: 'Text', text: /2 of 3 sessions within 3 days · 1 hidden/ })).toBeDefined()
+
+  // Each change is saved at once.
+  await ui.press({ key: 'sort' })
+  expect(saved.prefs).toEqual({ sort: 'touch', cutoff: '3d' })
+  await ui.press({ key: 'cutoff-1w' })
+  expect(saved.prefs).toEqual({ sort: 'touch', cutoff: '1w' })
+  await ui.input({ key: 'cutoff', text: '90m' })
+  expect(saved.prefs).toEqual({ sort: 'touch', cutoff: '90m' })
+  await ui.unmount()
+})
+
+test('saved choices that make no sense are ignored', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME })
+  fakeFiles(on)
+  quietApp(on)
+  fakeStore(on, { prefs: { sort: 'sideways', cutoff: 'soon' }, hidden: 'local_a' })
+  await startSession($, on)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  expect((await ui.find({ key: 'sort' }))?.props.label).toBe('Sort: your last touch')
+  expect((await ui.find({ key: 'cutoff-1d' }))?.props.variant).toBe('primary')
+  expect((await ui.find({ key: 'show-hidden' }))?.props.label).toBe('Show hidden (0)')
+  await ui.unmount()
+})
+
+test('a session can be hidden, shown again under Show hidden, and unhidden', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME })
+  fakeFiles(on)
+  quietApp(on)
+  const saved: Record<string, unknown> = {}
+  fakeStore(on, saved)
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'refresh' })
+    await ui.press({ key: 'cutoff-all' })
+    const order = async () =>
+      (await ui.findAll({ type: 'Button' }))
+        .map(one => one.key)
+        .filter(key => key?.startsWith('local_'))
+    expect(await order()).toEqual(['local_a', 'local_b', 'local_c'])
+    expect((await ui.find({ key: 'show-hidden' }))?.props.label).toBe('Show hidden (0)')
+
+    await ui.press({ key: 'hide-local_b' })
+    expect(await order()).toEqual(['local_a', 'local_c'])
+    expect(saved.hidden).toEqual(['local_b'])
+    expect((await ui.find({ key: 'show-hidden' }))?.props.label).toBe('Show hidden (1)')
+    expect(await ui.find({ type: 'Text', text: /2 of 3 sessions · 1 hidden/ })).toBeDefined()
+
+    await ui.press({ key: 'show-hidden' })
+    expect(await order()).toEqual(['local_a', 'local_b', 'local_c'])
+    expect((await ui.find({ key: 'local_b' }))?.text).toMatch(/\(hidden\)/)
+    expect((await ui.find({ key: 'hide-local_b' }))?.props.label).toBe('unhide')
+    expect((await ui.find({ key: 'show-hidden' }))?.props.label).toBe('Hide hidden')
+
+    await ui.press({ key: 'hide-local_b' })
+    expect(saved.hidden).toEqual([])
+    await ui.press({ key: 'show-hidden' })
+    expect(await order()).toEqual(['local_a', 'local_b', 'local_c'])
+    await ui.press({ key: 'cutoff-1d' })
+    await ui.unmount()
+  }
+})

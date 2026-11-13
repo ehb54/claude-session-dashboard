@@ -38,6 +38,10 @@ declare module 'claude-code' {
       /** How far back the sorted time may be: `1d`, `45m`, `2M`, ... or `all`. */
       cutoff: string
       archived: boolean
+      /** Ids of the sessions the person hid from the list. */
+      hidden: string[]
+      /** Whether hidden sessions show anyway, marked. */
+      showHidden: boolean
       filter: string
       status: Shaped<Status>
     }
