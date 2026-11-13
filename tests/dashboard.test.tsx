@@ -1,6 +1,18 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { ago, lastHumanAt, linkPrefix, parseCutoff, projectSlug } from '../hooks/data'
+import {
+  HUMAN_MARKER,
+  ago,
+  countIssues,
+  issueRefs,
+  lastHumanAt,
+  linkPrefix,
+  parseCutoff,
+  parsePrs,
+  parseScanOutput,
+  projectSlug,
+  refLabels,
+} from '../hooks/data'
 
 const NOW = Date.parse('2026-11-13T12:00:00Z')
 const MIN = 60_000
@@ -17,8 +29,14 @@ const iso = (ms: number) => new Date(ms).toISOString()
 // "Alpha" was prompted by the person a minute ago but has been quiet since;
 // "Beta" was last touched a day ago but Claude worked in it just now;
 // "Gamma" is old, ungrouped, and no lookup of the app returns it.
+const GH = 'https://github.com/o'
+const say = (at: number, text: string) =>
+  JSON.stringify({ type: 'assistant', timestamp: iso(at), message: { content: [{ type: 'text', text }] } })
+// Alpha links four issues: tickets#12 twice (once to a comment), the rest once.
 const transcriptA = [
   JSON.stringify({ type: 'user', timestamp: iso(NOW - 90 * MIN), origin: { kind: 'human' } }),
+  say(NOW - 80 * MIN, `Filed ${GH}/tickets/issues/12 and ${GH}/tickets/issues/15.`),
+  say(NOW - 70 * MIN, `See ${GH}/tickets/issues/12#issuecomment-1, ${GH}/tickets/issues/20 and ${GH}/app/issues/4.`),
   JSON.stringify({ type: 'user', timestamp: iso(NOW - 1 * MIN), origin: { kind: 'human' } }),
   JSON.stringify({ type: 'assistant', timestamp: iso(NOW - 30 * 1000) }),
 ].join('\n')
@@ -31,7 +49,14 @@ const transcriptB = [
   }),
 ].join('\n')
 
-const record = (id: string, cli: string, focused: number, active: number, title?: string) =>
+const record = (
+  id: string,
+  cli: string,
+  focused: number,
+  active: number,
+  title?: string,
+  extra: Record<string, unknown> = {},
+) =>
   JSON.stringify({
     sessionId: id,
     cliSessionId: cli,
@@ -39,12 +64,24 @@ const record = (id: string, cli: string, focused: number, active: number, title?
     title,
     lastFocusedAt: focused,
     lastActivityAt: active,
+    ...extra,
   })
 
+// Alpha has two pull requests (the open one shows first) and one the app
+// could not have opened, which is dropped; Gamma has one in the older field.
+const alphaPrs = {
+  prs: [
+    { prNumber: 7, url: `${GH}/app/pull/7`, repo: 'o/app', state: 'MERGED', branch: 'x' },
+    { prNumber: 9, url: `${GH}/app/pull/9`, repo: 'o/app', state: 'OPEN', branch: 'y' },
+    { prNumber: 5, url: '-a Calculator', repo: 'o/app', state: 'OPEN' },
+  ],
+}
+const gammaPr = { prNumber: 3, prUrl: `${GH}/lib/pull/3`, prRepository: 'o/lib', prState: 'CLOSED' }
+
 const files: Record<string, string> = {
-  [`${ORG}/local_a.json`]: record('local_a', 'cli-a', NOW - 50 * MIN, NOW - 40 * MIN),
+  [`${ORG}/local_a.json`]: record('local_a', 'cli-a', NOW - 50 * MIN, NOW - 40 * MIN, undefined, alphaPrs),
   [`${ORG}/local_b.json`]: record('local_b', 'cli-b', NOW - 25 * 60 * MIN, NOW - 1 * MIN),
-  [`${ORG}/local_c.json`]: record('local_c', 'cli-c', NOW - 5 * DAY, NOW - 6 * DAY, 'Gamma task'),
+  [`${ORG}/local_c.json`]: record('local_c', 'cli-c', NOW - 5 * DAY, NOW - 6 * DAY, 'Gamma task', gammaPr),
   [`${PROJECT}/cli-a.jsonl`]: transcriptA,
   [`${PROJECT}/cli-b.jsonl`]: transcriptB,
 }
@@ -169,8 +206,10 @@ test('every session shows, sorted by last touch or activity, filtered, and opens
     return { value: { content: [], isError: true } }
   })
   on('process.run', (_, e) => {
-    // No shell here, so transcripts are read whole; the opener is recorded.
-    if (e.argv[0] === 'sh') return { value: { exitCode: 127, stdout: '', stderr: 'no sh' } }
+    // No perl or shell here, so transcripts are read whole; the opener is recorded.
+    if (e.argv[0] === 'sh' || e.argv[0] === 'perl') {
+      return { value: { exitCode: 127, stdout: '', stderr: 'not here' } }
+    }
     opened.push([...e.argv])
     steps.push(`open ${e.argv[e.argv.length - 1]}`)
 
@@ -213,6 +252,11 @@ test('every session shows, sorted by last touch or activity, filtered, and opens
     expect(await ui.find({ type: 'Text', text: /servers · you 20h · any 1m/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /no group · you 5d · any 6d/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /4 of 4 sessions · scanned just now/ })).toBeDefined()
+    // Pull requests from the index, issues from the transcript read whole.
+    expect((await ui.find({ key: 'pr-local_a-0' }))?.props.label).toBe('app#9 open')
+    expect((await ui.find({ key: 'issue-local_a-0' }))?.props.label).toBe('tickets#12')
+    expect((await ui.find({ key: 'pr-local_c-0' }))?.props.label).toBe('lib#3 closed')
+    expect(await ui.find({ key: 'refs-local_b' })).toBeUndefined()
 
     // By last activity: Beta 1m, self 10m, Alpha 40m, Gamma 6d.
     await ui.press({ key: 'sort' })
@@ -235,6 +279,11 @@ test('every session shows, sorted by last touch or activity, filtered, and opens
 
     await ui.input({ key: 'filter', text: 'serv', kind: 'change' })
     expect(await order()).toEqual(['local_b'])
+    // The filter matches pull requests and issues too, folded ones included.
+    await ui.input({ key: 'filter', text: 'app#4', kind: 'change' })
+    expect(await order()).toEqual(['local_a'])
+    await ui.input({ key: 'filter', text: 'lib#3', kind: 'change' })
+    expect(await order()).toEqual(['local_c'])
     await ui.input({ key: 'filter', text: '', kind: 'change' })
 
     opened.length = 0
@@ -316,6 +365,145 @@ test('helpers', async () => {
   expect(ago(NOW - 5 * 1000, NOW)).toBe('now')
   expect(ago(NOW - 3 * 60 * MIN, NOW)).toBe('3h')
   expect(ago(NOW - 3 * DAY, NOW)).toBe('3d')
+
+  const prs = parsePrs(alphaPrs)
+  expect(prs.map(pr => [pr.repo, pr.number, pr.state])).toEqual([
+    ['o/app', 9, 'open'],
+    ['o/app', 7, 'merged'],
+  ])
+  expect(parsePrs(gammaPr)).toEqual([
+    { repo: 'o/lib', number: 3, url: `${GH}/lib/pull/3`, state: 'closed', mentions: 0 },
+  ])
+  // A repo and number can come from the link alone; the same link twice is one.
+  expect(parsePrs({ prs: [{ url: `${GH}/x/pull/2` }, { url: `${GH}/x/pull/2` }], prUrl: 7 })).toEqual([
+    { repo: 'o/x', number: 2, url: `${GH}/x/pull/2`, state: null, mentions: 0 },
+  ])
+  expect(parsePrs({ prs: 'nope' })).toEqual([])
+
+  const counts = countIssues(transcriptA)
+  expect([...counts]).toEqual([
+    [`${GH}/tickets/issues/12`, 2],
+    [`${GH}/tickets/issues/15`, 1],
+    [`${GH}/tickets/issues/20`, 1],
+    [`${GH}/app/issues/4`, 1],
+  ])
+  const issues = issueRefs(counts)
+  expect(issues.map(one => `${one.repo}#${one.number}x${one.mentions}`)).toEqual([
+    'o/tickets#12x2',
+    'o/tickets#20x1',
+    'o/tickets#15x1',
+    'o/app#4x1',
+  ])
+  // Case is one issue; a link that is not an issue is not counted.
+  expect(issueRefs(new Map([[`${GH}/T/issues/1`, 1], [`${GH}/t/issues/1`, 2], ['https://x/y', 5]])))
+    .toEqual([{ repo: 'o/T', number: 1, url: `${GH}/T/issues/1`, state: null, mentions: 3 }])
+  // One repo's refs stay together and only the first is named.
+  expect(refLabels([issues[0]!, issues[3]!, issues[1]!]).map(one => one.label)).toEqual(['tickets#12', '#20', 'app#4'])
+  expect(refLabels(prs).map(one => one.label)).toEqual(['app#9 open', '#7 merged'])
+
+  const out = parseScanOutput(`   2 ${GH}/a/issues/3\n"timestamp":"${iso(NOW)}"\n1 ${GH}/a/issues/4\n`)
+  expect(out.at).toBe(NOW)
+  expect([...out.issues]).toEqual([[`${GH}/a/issues/3`, 2], [`${GH}/a/issues/4`, 1]])
+  expect(parseScanOutput('')).toEqual({ at: null, issues: new Map() })
+})
+
+/** Answers the lookups of the first test's app: groups, the window, the sessions. */
+const app = (on: Parameters<Parameters<typeof test>[1]>[1]) => {
+  on('mcp.call', (_, e) => {
+    if (e.server === 'ccd_sidebar' && e.tool === 'list_groups') return json(groups)
+    if (e.server === 'ccd_window' && e.tool === 'get_window_layout') {
+      return json({ this_session: { session_id: 'local_self' }, popout_windows: { sessions: [] } })
+    }
+    if (e.tool === 'get_session') return json(self)
+    if (e.tool === 'list_sessions' && e.args.group === 'g1') return json([alpha])
+    if (e.tool === 'list_sessions' && e.args.group === 'g2') return json([beta])
+    if (e.tool === 'list_sessions') return json([])
+
+    return { value: { content: [], isError: true } }
+  })
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.toast', () => ({ value: undefined }))
+}
+
+test('perl scans the transcripts; pull requests and issues fold, unfold and open in the browser', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME })
+  fakeFiles(on)
+  app(on)
+  const ran: string[][] = []
+  on('process.run', (_, e) => {
+    ran.push([...e.argv])
+    if (e.argv[0] === 'perl' && e.argv[2] === 'exit 0') return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    if (e.argv[0] === 'perl') {
+      // perl -e <script> <marker> <path>: a prompt 3 minutes ago, unlike the file read whole.
+      expect(e.argv[3]).toBe(HUMAN_MARKER)
+      const stdout = e.argv[4] === `${PROJECT}/cli-a.jsonl`
+        ? [`"timestamp":"${iso(NOW - 3 * MIN)}"`, ...[...countIssues(transcriptA)].map(([url, n]) => `${n} ${url}`)].join('\n')
+        : ''
+
+      return { value: { exitCode: 0, stdout, stderr: '' } }
+    }
+    if (e.argv[0] === 'sh') return { value: { exitCode: 0, stdout: '', stderr: '' } }
+
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'refresh' })
+    expect(await ui.find({ type: 'Text', text: /research · you 3m · any 40m/ })).toBeDefined()
+    expect(ran.some(argv => argv[0] === 'sh' && argv[1] === '-c' && argv.length > 3)).toBe(false)
+
+    const labels = async (prefix: string) =>
+      (await ui.findAll({ type: 'Button' }))
+        .filter(one => one.key?.startsWith(prefix))
+        .map(one => one.props.label)
+    expect(await labels('pr-local_a-')).toEqual(['app#9 open', '#7 merged'])
+    // Three issues until the row is unfolded; the fourth waits under "+1 more".
+    expect(await labels('issue-local_a-')).toEqual(['tickets#12', '#20', '#15'])
+    expect((await ui.find({ key: 'more-local_a' }))?.props.label).toBe('+1 more')
+    await ui.press({ key: 'more-local_a' })
+    expect(await labels('issue-local_a-')).toEqual(['tickets#12', '#20', '#15', 'app#4'])
+    expect((await ui.find({ key: 'more-local_a' }))?.props.label).toBe('fewer')
+    await ui.press({ key: 'more-local_a' })
+    expect(await labels('issue-local_a-')).toEqual(['tickets#12', '#20', '#15'])
+
+    // A press opens the link in the browser, with no pop-out first.
+    ran.length = 0
+    await ui.press({ key: 'issue-local_a-0' })
+    await ui.press({ key: 'pr-local_a-1' })
+    expect(ran).toEqual([
+      ['/usr/bin/open', `${GH}/tickets/issues/12`],
+      ['/usr/bin/open', `${GH}/app/pull/7`],
+    ])
+    await ui.unmount()
+  }
+})
+
+test('without perl, grep through sh scans the transcripts', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME })
+  fakeFiles(on)
+  app(on)
+  on('process.run', (_, e) => {
+    if (e.argv[0] === 'perl') return { value: { exitCode: 127, stdout: '', stderr: 'no perl' } }
+    if (e.argv[0] === 'sh' && e.argv[2] === 'exit 0') return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    if (e.argv[0] === 'sh' && e.argv[4] === `${PROJECT}/cli-a.jsonl`) {
+      expect(e.argv[2]).toMatch(/grep -F -- \/issues\//)
+      const stdout = `"timestamp":"${iso(NOW - 4 * MIN)}"\n   1 ${GH}/app/issues/4\n`
+
+      return { value: { exitCode: 0, stdout, stderr: '' } }
+    }
+
+    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+  })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'refresh' })
+  expect(await ui.find({ type: 'Text', text: /research · you 4m · any 40m/ })).toBeDefined()
+  expect((await ui.find({ key: 'issue-local_a-0' }))?.props.label).toBe('app#4')
+  expect(await ui.find({ key: 'more-local_a' })).toBeUndefined()
+  await ui.unmount()
 })
 
 /** Answers every app lookup with an empty list: rows then come from the index alone. */

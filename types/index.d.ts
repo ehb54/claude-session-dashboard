@@ -1,3 +1,15 @@
+/** A GitHub pull request or issue a session worked on. */
+export type Ref = {
+  /** `owner/name`. */
+  repo: string
+  number: number
+  url: string
+  /** Pull requests: `open`, `merged` or `closed`, as the app last saw it. Issues: null. */
+  state: string | null
+  /** Issues: how many times the session's transcript links it. Pull requests: 0. */
+  mentions: number
+}
+
 /** One session as the dashboard lists it. Times are epoch milliseconds. */
 export type Row = {
   /** The desktop app's session id (`local_...`). */
@@ -17,6 +29,10 @@ export type Row = {
   focusedAt: number | null
   /** When the person last sent the session a prompt of their own. */
   humanAt: number | null
+  /** Pull requests the app linked to the session, open ones first. */
+  prs: Ref[]
+  /** Issues the session's transcript links, most linked first. */
+  issues: Ref[]
 }
 
 export type SortKey = 'touch' | 'activity'
@@ -42,6 +58,8 @@ declare module 'claude-code' {
       hidden: string[]
       /** Whether hidden sessions show anyway, marked. */
       showHidden: boolean
+      /** Ids of the rows showing all their pull requests and issues. */
+      expanded: string[]
       filter: string
       status: Shaped<Status>
     }

@@ -3,8 +3,9 @@
 A Claude Code mod that adds a **Sessions** pane to the Code tab of the Claude
 desktop app: every session you have, in one list, whatever sidebar group it is
 filed under, sorted by when **you** last touched it or by its last activity of
-any kind. Click a row to jump to that session; the dashboard moves to a window
-of its own first, so it stays in view.
+any kind, with the pull requests and issues each one worked on. Click a row
+to jump to that session; the dashboard moves to a window of its own first, so
+it stays in view.
 
 The sidebar keeps each custom group in its own section and sorts within it,
 so with many groups and many sessions it is hard to see what you worked on
@@ -15,16 +16,26 @@ last. This pane answers that.
 ```
 [Sort: your last touch] [Show archived] [Show hidden (2)] [Refresh] [Pop out]
 Within [1d] [1w] [1M] [all]  [or type 30m, 6h, 2w, 3M] [Set]
-[Filter by title or group]
+[Filter by title, group, PR or issue]
 12 of 275 sessions within 1 day · 2 hidden · scanned just now · ● running
 ● Build the release scripts
     infra · you 3m · any 1m  hide
+    PRs tools#41 open #38 merged · issues tickets#212 #208 #199 +2 more
   Review the parser change
     no group · you 2h · any 5h  hide
+    PRs parser#17 open
 ```
 
 - **One row per session**: title (● when it is running), then its sidebar
   group, **you** (your last touch) and **any** (last activity of any kind).
+- **PRs and issues** the session worked on, on a third line when it has any:
+  - **PRs** are the pull requests the app linked to the session, with their
+    state as the app last saw it, open ones first.
+  - **issues** are the GitHub issues the session's transcript links, the most
+    linked first.
+  - A repository is named once, then just `#number`. Up to three of each
+    show; **+N more** shows the rest, **fewer** folds them again.
+  - Click one to open it in your browser.
 - **Your last touch** is the later of when you last opened the session and
   when you last sent it a prompt yourself. Messages other sessions relayed to
   it and background-task notifications do not count.
@@ -36,7 +47,9 @@ Within [1d] [1w] [1M] [all]  [or type 30m, 6h, 2w, 3M] [Set]
   `90m` is ninety minutes and `2M` two months. Decimals work (`1.5h`). With a
   cutoff set, a session with no time at all (never opened, never prompted)
   shows only under **all**.
-- **Filter** keeps rows whose title or group contains every word you type.
+- **Filter** keeps rows whose title, group, PRs or issues contain every word
+  you type: `tickets#212` or `#212` finds the sessions on that issue, folded
+  ones included.
 - **hide** on a row takes that session off the list. **Show hidden (N)** brings
   hidden sessions back, marked "(hidden)", each with **unhide**.
 - **Show archived** adds archived sessions.
@@ -94,18 +107,24 @@ reads:
   for these in small pieces, since a list of hundreds of sessions is too large
   to come back through one call.
 - **The app's session index**, one small JSON file per session, for the full
-  list, when you last opened each session, and which transcript it writes:
+  list, when you last opened each session, the pull requests the app linked
+  to it, and which transcript it writes:
   - macOS: `~/Library/Application Support/Claude/claude-code-sessions/`
   - Windows: `%APPDATA%\Claude\claude-code-sessions\`
   - Linux: `$XDG_CONFIG_HOME/Claude/claude-code-sessions/` (default `~/.config`)
 - **Claude Code's transcripts** under `~/.claude/projects/` (or
-  `$CLAUDE_CONFIG_DIR/projects/`), only to find the time of your last prompt:
-  it runs `grep` for the `"origin":{"kind":"human"}` marker through `sh` and
-  keeps only that line's timestamp. Without `sh`, it reads transcripts of up to
-  4 MiB directly and skips larger ones.
+  `$CLAUDE_CONFIG_DIR/projects/`), only to find the time of your last prompt
+  (the last line with the `"origin":{"kind":"human"}` marker) and the GitHub
+  issue links. One `perl` pass per transcript reads each file once and prints
+  just those findings. Without `perl` it does the same with `grep` through
+  `sh`, which is several times slower. Without either, it reads transcripts
+  of up to 4 MiB directly and skips larger ones. A transcript is read again
+  only after it changes.
 
 To open a session it runs the app's own link for it (`claude://...`) through
-`open` on macOS, `xdg-open` on Linux, or `start` on Windows.
+`open` on macOS, `xdg-open` on Linux, or `start` on Windows. A PR or issue
+opens the same way, with its `https://` link. Only `https://` links are ever
+opened.
 
 ## Limits
 
@@ -116,6 +135,12 @@ To open a session it runs the app's own link for it (`claude://...`) through
   app update can change either; the pane then shows a warning line saying
   which lookup failed rather than quietly listing fewer sessions.
 - Only sessions of the account the dashboard runs under are listed.
+- Issues are counted from full `https://github.com/<owner>/<repo>/issues/<n>`
+  links anywhere in the transcript: in your prompts, in Claude's replies, and
+  in tool output. A bare `#12` is not counted, and neither is GitHub
+  Enterprise. An issue a session only listed in passing can show up, usually
+  below the ones it worked on, since those are linked more often.
+- A PR's state is the one the app last recorded, which can lag behind GitHub.
 - A session no lookup returned gets a link built from the shape of the links
   the app did return.
 
@@ -129,7 +154,9 @@ claude plugin test .
 The tests run the pane on the desktop and terminal surfaces against a fake
 app: sorting both ways, the cutoff presets and typed values, the filter, the
 pop-out before the first open, hiding and unhiding, choices saved and restored
-across sessions, and the fallback when the app's lookups fail.
+across sessions, PRs and issues folding, unfolding and opening, the perl,
+grep and in-memory transcript scans, and the fallback when the app's lookups
+fail.
 
 ## License
 

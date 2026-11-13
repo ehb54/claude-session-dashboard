@@ -1,12 +1,19 @@
 // Pure helpers: parsing what the app and the transcripts hold, merging it
 // into rows, sorting and formatting. Nothing here touches the engine.
 
-import type { Row, SortKey } from '../types'
+import type { Ref, Row, SortKey } from '../types'
 
 /** A transcript line holding this marker is a prompt the person sent. */
 export const HUMAN_MARKER = '"origin":{"kind":"human"}'
 
 const TIMESTAMP = /"timestamp":"([^"]+)"/g
+
+/** A GitHub issue link, as transcripts hold it (`.../issues/12#issuecomment-...` counts as 12). */
+const ISSUE_LINK = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/issues\/\d+/g
+const ISSUE_URL = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)$/
+const PR_URL = /^https:\/\/[^/\s]+\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/pull\/(\d+)/
+/** Only web links are opened: nothing an opener could take for an option or a file. */
+const WEB_URL = /^https:\/\/\S+$/
 
 /** What the app's own session index file says about one session. */
 export type IndexRecord = {
@@ -20,6 +27,8 @@ export type IndexRecord = {
   focusedAt: number | null
   activityAt: number | null
   isArchived: boolean
+  /** The pull requests the app linked to the session, open ones first. */
+  prs: Ref[]
 }
 
 /** One session as the app's session list reports it. */
@@ -47,6 +56,33 @@ const asTime = (value: unknown): number | null => {
   return Number.isNaN(ms) ? null : ms
 }
 
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+/**
+ * The pull requests one index record links: its `prs` list, plus the single
+ * `prUrl` an older version of the app kept. Open ones come first; otherwise
+ * the app's order stands.
+ */
+export function parsePrs(data: Record<string, unknown>): Ref[] {
+  const items = Array.isArray(data.prs) ? data.prs.filter(isObject) : []
+  if (typeof data.prUrl === 'string') {
+    items.push({ url: data.prUrl, prNumber: data.prNumber, repo: data.prRepository, state: data.prState })
+  }
+  const out = new Map<string, Ref>()
+  for (const item of items) {
+    const url = asString(item.url)
+    if (url === null || !WEB_URL.test(url) || out.has(url)) continue
+    const match = PR_URL.exec(url)
+    const repo = asString(item.repo) ?? match?.[1] ?? null
+    const number = asNumber(item.prNumber) ?? (match === null ? null : Number(match[2]))
+    if (repo === null || number === null) continue
+    out.set(url, { repo, number, url, state: asString(item.state)?.toLowerCase() ?? null, mentions: 0 })
+  }
+
+  return [...out.values()].sort((a, b) => Number(b.state === 'open') - Number(a.state === 'open'))
+}
+
 /** Reads one `local_*.json` file of the app's session index. */
 export function parseIndexRecord(text: string, dir: string): IndexRecord | null {
   let data: Record<string, unknown>
@@ -70,6 +106,7 @@ export function parseIndexRecord(text: string, dir: string): IndexRecord | null 
     focusedAt: asNumber(data.lastFocusedAt),
     activityAt: asNumber(data.lastActivityAt),
     isArchived: data.isArchived === true,
+    prs: parsePrs(data),
   }
 }
 
@@ -146,6 +183,83 @@ export function lastHumanAt(transcript: string): number | null {
   return null
 }
 
+/** What one transcript says: when the person last prompted it, and each issue link with its count. */
+export type TranscriptScan = { at: number | null; issues: Map<string, number> }
+
+/** Each GitHub issue link in a text, with how many times it appears. */
+export function countIssues(text: string): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const match of text.matchAll(ISSUE_LINK)) out.set(match[0], (out.get(match[0]) ?? 0) + 1)
+
+  return out
+}
+
+/** Scans a whole transcript in memory, for when no outside program can. */
+export const scanTranscriptText = (text: string): TranscriptScan => ({
+  at: lastHumanAt(text),
+  issues: countIssues(text),
+})
+
+/**
+ * Reads what the transcript scanners print: the last prompt's
+ * `"timestamp":"..."` and one `<count> <issue link>` line per issue, in any order.
+ */
+export function parseScanOutput(out: string): TranscriptScan {
+  let at: number | null = null
+  const issues = new Map<string, number>()
+  for (const line of out.split('\n')) {
+    const counted = /^\s*(\d+)\s+(https:\/\/\S+)\s*$/.exec(line)
+    if (counted !== null) {
+      const url = counted[2] ?? ''
+      issues.set(url, (issues.get(url) ?? 0) + Number(counted[1]))
+      continue
+    }
+    at = lineTimestamp(line) ?? at
+  }
+
+  return { at, issues }
+}
+
+/**
+ * Issue refs from link counts, most linked first, then the higher number.
+ * Links that differ only in case are one issue.
+ */
+export function issueRefs(counts: ReadonlyMap<string, number>): Ref[] {
+  const byKey = new Map<string, Ref>()
+  for (const [url, mentions] of counts) {
+    const match = ISSUE_URL.exec(url)
+    if (match === null) continue
+    const key = url.toLowerCase()
+    const seen = byKey.get(key)
+    if (seen !== undefined) seen.mentions += mentions
+    else byKey.set(key, { repo: match[1] ?? '', number: Number(match[2]), url, state: null, mentions })
+  }
+
+  return [...byKey.values()].sort(
+    (a, b) => b.mentions - a.mentions || b.number - a.number || a.repo.localeCompare(b.repo),
+  )
+}
+
+/**
+ * How refs are drawn in a row: refs of one repository together, in the order
+ * their first one came; the first named `name#12`, the rest `#15`; a pull
+ * request's state after its number.
+ */
+export function refLabels(refs: readonly Ref[]): { ref: Ref; label: string }[] {
+  const byRepo = new Map<string, Ref[]>()
+  for (const ref of refs) {
+    const key = ref.repo.toLowerCase()
+    byRepo.set(key, [...(byRepo.get(key) ?? []), ref])
+  }
+
+  return [...byRepo.values()].flatMap(group =>
+    group.map((ref, i) => ({
+      ref,
+      label: `${i === 0 ? ref.repo.slice(ref.repo.indexOf('/') + 1) : ''}#${ref.number}${ref.state === null ? '' : ` ${ref.state}`}`,
+    })),
+  )
+}
+
 const latest = (...times: (number | null)[]): number | null => {
   const known = times.filter((t): t is number => t !== null)
 
@@ -200,6 +314,8 @@ export function mergeRows(args: {
       activityAt: latest(item?.activityAt ?? null, rec?.activityAt ?? null),
       focusedAt: rec?.focusedAt ?? null,
       humanAt: humanAt.get(id) ?? null,
+      prs: rec?.prs ?? [],
+      issues: [],
     })
   }
 
@@ -283,13 +399,17 @@ export function sortRows(rows: readonly Row[], key: SortKey): Row[] {
   })
 }
 
-/** Rows whose title or group holds every word of the filter, any case. */
+/**
+ * Rows whose title, group or pull requests and issues (`owner/name#12`) hold
+ * every word of the filter, any case.
+ */
 export function filterRows(rows: readonly Row[], filter: string): Row[] {
   const words = filter.toLowerCase().split(/\s+/).filter(Boolean)
   if (words.length === 0) return [...rows]
 
   return rows.filter(row => {
-    const hay = `${row.title} ${row.group ?? ''}`.toLowerCase()
+    const refs = [...row.prs, ...row.issues].map(ref => `${ref.repo}#${ref.number}`)
+    const hay = [row.title, row.group ?? '', ...refs].join(' ').toLowerCase()
 
     return words.every(word => hay.includes(word))
   })

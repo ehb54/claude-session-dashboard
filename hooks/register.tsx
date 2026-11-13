@@ -1,25 +1,27 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, McpToolResult, Register } from 'claude-code'
 
-import type { Row, SortKey, Status } from '../types'
+import type { Ref, Row, SortKey, Status } from '../types'
 import {
   CUTOFF_PRESETS,
   HUMAN_MARKER,
   ago,
   filterRows,
-  lastHumanAt,
-  lineTimestamp,
+  issueRefs,
   mergeRows,
   ownRecords,
   parseCutoff,
   parseIndexRecord,
   parseListed,
+  parseScanOutput,
   projectSlug,
+  refLabels,
+  scanTranscriptText,
   sortRows,
   touchAt,
   withinCutoff,
 } from './data'
-import type { IndexRecord, Listed } from './data'
+import type { IndexRecord, Listed, TranscriptScan } from './data'
 
 type Engine = EngineInterface
 
@@ -42,17 +44,42 @@ const REFRESH_MS = 30_000
 const READ_LIMIT = 4 * 1024 * 1024
 /** Transcripts scanned at once. */
 const BATCH = 8
+/** Pull requests, and issues, a row shows until it is expanded. */
+const REF_LIMIT = 3
+
+/**
+ * One pass over a transcript: the timestamps of the last line marked as the
+ * person's prompt, then each GitHub issue link with how often it appears.
+ * Each line is tested with `index` before a pattern runs, so it keeps up with
+ * transcripts of hundreds of MB (several times faster than grep).
+ */
+const PERL_SCAN = String.raw`my ($mark, $path) = @ARGV; my ($t, %n);
+open(my $f, '<', $path) or exit 2;
+while (<$f>) {
+  if (index($_, $mark) >= 0) { while (/"timestamp":"([^"]*)"/g) { $t = $1 } }
+  if (index($_, '/issues/') >= 0) {
+    while (m{(https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+)}g) { $n{$1}++ }
+  }
+}
+print qq{"timestamp":"$t"\n} if defined $t;
+print "$n{$_} $_\n" for keys %n;`
+
+/** The same through grep, where there is a shell but no perl. */
+const GREP_SCAN =
+  'grep -F -- "$0" "$1" | tail -n 1 | grep -o \'"timestamp":"[^"]*"\' | tail -n 1; ' +
+  'grep -F -- /issues/ "$1" | grep -o -E \'https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+\' | sort | uniq -c'
 
 // Change a tag when that value's fields change: it declines what an earlier
 // version stored, which outlives a reload.
 const rowsAtom = atom({ plugin: 'session-dashboard', key: 'rows' } as const, [] as Row[], {
-  shape: 'rows-1',
+  shape: 'rows-2',
 })
 const sortAtom = atom({ plugin: 'session-dashboard', key: 'sort' } as const, 'touch' as SortKey)
 const cutoffAtom = atom({ plugin: 'session-dashboard', key: 'cutoff' } as const, '1d')
 const archivedAtom = atom({ plugin: 'session-dashboard', key: 'archived' } as const, false)
 const hiddenAtom = atom({ plugin: 'session-dashboard', key: 'hidden' } as const, [] as string[])
 const showHiddenAtom = atom({ plugin: 'session-dashboard', key: 'showHidden' } as const, false)
+const expandedAtom = atom({ plugin: 'session-dashboard', key: 'expanded' } as const, [] as string[])
 const filterAtom = atom({ plugin: 'session-dashboard', key: 'filter' } as const, '')
 const statusAtom = atom(
   { plugin: 'session-dashboard', key: 'status' } as const,
@@ -65,9 +92,9 @@ type Mark = { size: number; mtimeMs: number }
 // Caches keyed by file path; a reload starts them over, which costs one full
 // scan and nothing else.
 const indexCache = new Map<string, Mark & { rec: IndexRecord | null }>()
-const humanCache = new Map<string, Mark & { at: number | null }>()
+const transcriptCache = new Map<string, Mark & TranscriptScan>()
 let scanning: Promise<void> | null = null
-let hasShell: boolean | null = null
+let scanners: Promise<{ perl: boolean; sh: boolean }> | null = null
 let opener: ((link: string) => string[]) | null = null
 
 const message = (err: unknown): string =>
@@ -209,54 +236,63 @@ async function scanIndex($: Engine, root: string): Promise<Map<string, IndexReco
   return out
 }
 
-async function shellWorks($: Engine): Promise<boolean> {
-  if (hasShell === null) {
-    try {
-      hasShell = (await $.process.run(['sh', '-c', 'exit 0'], { timeoutMs: 5000 })).exitCode === 0
-    } catch {
-      hasShell = false
-    }
-  }
-
-  return hasShell
-}
-
-/** The last prompt the person sent in one transcript file. */
-async function findHuman($: Engine, path: string, size: number): Promise<number | null> {
-  if (await shellWorks($)) {
-    // Only the timestamps of the last marked line come back, however long it is.
-    const script =
-      'grep -F -- "$0" "$1" | tail -n 1 | grep -o \'"timestamp":"[^"]*"\' | tail -n 1'
-    const run = await $.process.run(['sh', '-c', script, HUMAN_MARKER, path], {
-      timeoutMs: 20_000,
-    })
-    if (run.exitCode === 0) return lineTimestamp(run.stdout)
-  }
-  if (size < READ_LIMIT) return lastHumanAt(await $.fs.read(path))
-  throw new Error('transcript too large to read without a shell')
-}
-
-async function humanAtOf($: Engine, path: string, mark: Mark): Promise<number | null> {
-  const hit = humanCache.get(path)
-  if (same(hit, mark)) return hit!.at
-  let at = hit?.at ?? null
+const works = async ($: Engine, argv: string[]): Promise<boolean> => {
   try {
-    at = await findHuman($, path, mark.size)
+    return (await $.process.run(argv, { timeoutMs: 5000 })).exitCode === 0
   } catch {
-    // Keep the last time known for this file.
+    return false
   }
-  humanCache.set(path, { size: mark.size, mtimeMs: mark.mtimeMs, at })
-
-  return at
 }
 
-/** The person's last prompt per session, from the transcripts it wrote. */
-async function scanHuman(
+/** Which outside scanners run here, asked once. */
+function scannersOf($: Engine): Promise<{ perl: boolean; sh: boolean }> {
+  scanners ??= (async () => ({
+    perl: await works($, ['perl', '-e', 'exit 0']),
+    sh: await works($, ['sh', '-c', 'exit 0']),
+  }))()
+
+  return scanners
+}
+
+/**
+ * One transcript file's last prompt from the person and its issue links:
+ * through perl, else grep, else read whole when it is small enough. Only the
+ * findings come back, however long the file is.
+ */
+async function scanFile($: Engine, path: string, size: number): Promise<TranscriptScan> {
+  const can = await scannersOf($)
+  const runs: string[][] = []
+  if (can.perl) runs.push(['perl', '-e', PERL_SCAN, HUMAN_MARKER, path])
+  if (can.sh) runs.push(['sh', '-c', GREP_SCAN, HUMAN_MARKER, path])
+  for (const argv of runs) {
+    const run = await $.process.run(argv, { timeoutMs: 60_000 })
+    if (run.exitCode === 0) return parseScanOutput(run.stdout)
+  }
+  if (size < READ_LIMIT) return scanTranscriptText(await $.fs.read(path))
+  throw new Error('transcript too large to read without perl or a shell')
+}
+
+async function transcriptOf($: Engine, path: string, mark: Mark): Promise<TranscriptScan> {
+  const hit = transcriptCache.get(path)
+  if (same(hit, mark)) return hit!
+  let found: TranscriptScan = { at: hit?.at ?? null, issues: hit?.issues ?? new Map() }
+  try {
+    found = await scanFile($, path, mark.size)
+  } catch {
+    // Keep what was last known for this file.
+  }
+  transcriptCache.set(path, { size: mark.size, mtimeMs: mark.mtimeMs, ...found })
+
+  return found
+}
+
+/** Per session, from the transcripts it wrote: the person's last prompt and its issue links. */
+async function scanTranscripts(
   $: Engine,
   projects: string,
   index: ReadonlyMap<string, IndexRecord>,
   ids: Iterable<string>,
-): Promise<Map<string, number | null>> {
+): Promise<Map<string, TranscriptScan>> {
   const listings = new Map<string, Map<string, Mark>>()
   const listing = async (dir: string) => {
     let names = listings.get(dir)
@@ -285,14 +321,20 @@ async function scanHuman(
       if (mark !== undefined) jobs.push({ id, path: `${dir}/${cli}.jsonl`, mark })
     }
   }
-  const out = new Map<string, number | null>()
+  const out = new Map<string, TranscriptScan>()
   for (let i = 0; i < jobs.length; i += BATCH) {
     const batch = jobs.slice(i, i + BATCH)
-    const times = await Promise.all(batch.map(job => humanAtOf($, job.path, job.mark)))
+    const found = await Promise.all(batch.map(job => transcriptOf($, job.path, job.mark)))
     batch.forEach((job, k) => {
-      const at = times[k] ?? null
-      const prev = out.get(job.id) ?? null
-      out.set(job.id, prev === null || (at !== null && at > prev) ? at : prev)
+      const one = found[k]
+      if (one === undefined) return
+      const prev = out.get(job.id)
+      if (prev === undefined) {
+        out.set(job.id, { at: one.at, issues: new Map(one.issues) })
+        return
+      }
+      if (one.at !== null && (prev.at === null || one.at > prev.at)) prev.at = one.at
+      for (const [url, n] of one.issues) prev.issues.set(url, (prev.issues.get(url) ?? 0) + n)
     })
   }
 
@@ -309,9 +351,11 @@ async function scan($: Engine): Promise<void> {
       selfId,
     )
     const rows = mergeRows({ index, listed, selfId, humanAt: new Map(), showArchived })
-    const humanAt = await scanHuman($, where.projects, index, rows.map(row => row.id))
+    const found = await scanTranscripts($, where.projects, index, rows.map(row => row.id))
     rows.forEach(row => {
-      row.humanAt = humanAt.get(row.id) ?? null
+      const one = found.get(row.id)
+      row.humanAt = one?.at ?? null
+      row.issues = issueRefs(one?.issues ?? new Map())
     })
     const notes: string[] = []
     if (errors.length > 0) {
@@ -353,7 +397,6 @@ async function openerFor($: Engine): Promise<(link: string) => string[]> {
   return opener
 }
 
-/** Opens the session in the app through its deep link, as the OS routes it. */
 /** Whether this session shows in a pop-out window of its own; null when the app does not say. */
 async function isPoppedOut($: Engine): Promise<boolean | null> {
   try {
@@ -385,6 +428,20 @@ async function popOut($: Engine): Promise<void> {
   await update($, statusAtom, status => ({ ...status, poppedOut }))
 }
 
+/** Opens a pull request or issue in the browser; the app's windows stay as they are. */
+async function openRef($: Engine, ref: Ref): Promise<void> {
+  const name = `${ref.repo}#${ref.number}`
+  try {
+    const run = await $.process.run((await openerFor($))(ref.url), { timeoutMs: 10_000 })
+    if (run.exitCode !== 0) {
+      await $.ui.toast(`Could not open ${name}: ${run.stderr.trim() || `exit ${run.exitCode}`}`)
+    }
+  } catch (err) {
+    await $.ui.toast(`Could not open ${name}: ${message(err)}`)
+  }
+}
+
+/** Opens the session in the app through its deep link, as the OS routes it. */
 async function openSession($: Engine, row: Row): Promise<void> {
   if (row.link === null) {
     await $.ui.toast(`No link for "${row.title}": open it from the sidebar.`)
@@ -502,6 +559,7 @@ export const register: Register = on => {
     const isPreset = (CUTOFF_PRESETS as readonly string[]).includes(cut.spec)
     const hidden = new Set(await read($, hiddenAtom))
     const showHidden = await read($, showHiddenAtom)
+    const expanded = new Set(await read($, expandedAtom))
     const hiddenCount = rows.filter(row => hidden.has(row.id)).length
     const now = await $.clock.now()
     const visible = filterRows(rows, filter).filter(row => showHidden || !hidden.has(row.id))
@@ -555,7 +613,7 @@ export const register: Register = on => {
         </Box>
         <Input
           key="filter"
-          placeholder="Filter by title or group"
+          placeholder="Filter by title, group, PR or issue"
           value={filter}
           onInput={value => void update($, filterAtom, () => value)}
           onSubmit={value => void update($, filterAtom, () => value)}
@@ -567,6 +625,15 @@ export const register: Register = on => {
         {status.error !== null && <Text color="warning">{status.error}</Text>}
         {shown.map(row => {
           const isHidden = hidden.has(row.id)
+          const isExpanded = expanded.has(row.id)
+          const prs = isExpanded ? row.prs : row.prs.slice(0, REF_LIMIT)
+          const issues = isExpanded ? row.issues : row.issues.slice(0, REF_LIMIT)
+          const more = row.prs.length - prs.length + row.issues.length - issues.length
+          const canFold = isExpanded && (row.prs.length > REF_LIMIT || row.issues.length > REF_LIMIT)
+          const toggle = () =>
+            void update($, expandedAtom, ids =>
+              isExpanded ? ids.filter(id => id !== row.id) : [...ids, row.id],
+            )
 
           return (
             <Box key={`row-${row.id}`} flexDirection="column">
@@ -585,6 +652,20 @@ export const register: Register = on => {
                   onPress={() => void setHidden($, row.id, !isHidden)}
                 />
               </Box>
+              {(prs.length > 0 || issues.length > 0) && (
+                <Box key={`refs-${row.id}`} flexDirection="row" flexWrap="wrap" columnGap={1} paddingLeft={4}>
+                  {prs.length > 0 && <Text dimColor>PRs</Text>}
+                  {refLabels(prs).map(({ ref, label }, i) => (
+                    <Button key={`pr-${row.id}-${i}`} plain dimColor label={label} onPress={() => void openRef($, ref)} />
+                  ))}
+                  {issues.length > 0 && <Text dimColor>{prs.length > 0 ? '· issues' : 'issues'}</Text>}
+                  {refLabels(issues).map(({ ref, label }, i) => (
+                    <Button key={`issue-${row.id}-${i}`} plain dimColor label={label} onPress={() => void openRef($, ref)} />
+                  ))}
+                  {more > 0 && <Button key={`more-${row.id}`} plain dimColor label={`+${more} more`} onPress={toggle} />}
+                  {canFold && <Button key={`more-${row.id}`} plain dimColor label="fewer" onPress={toggle} />}
+                </Box>
+              )}
             </Box>
           )
         })}
