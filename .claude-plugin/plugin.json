@@ -1,0 +1,9 @@
+{
+  "name": "session-dashboard",
+  "version": "0.1.0",
+  "description": "A pane listing every Claude Code desktop session across sidebar groups, sorted by your last touch or by last activity; click a row to open it.",
+  "author": { "name": "ehb54" },
+  "license": "MIT",
+  "repository": "https://github.com/ehb54/claude-session-dashboard",
+  "types": "./types/index.d.ts"
+}
