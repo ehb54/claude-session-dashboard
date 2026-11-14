@@ -11,6 +11,64 @@ The sidebar keeps each custom group in its own section and sorts within it,
 so with many groups and many sessions it is hard to see what you worked on
 last. This pane answers that.
 
+## Install
+
+Add this repository as a marketplace, then install the plugin from it. At the
+prompt of a Claude Code terminal session:
+
+```
+/plugin marketplace add ehb54/claude-session-dashboard
+/plugin install session-dashboard@claude-session-dashboard
+```
+
+The part after `@` is the marketplace's name from
+[`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json), not the
+repository path. Pick a scope when asked: user scope makes the plugin
+available in every session, the desktop app's included, because terminal
+sessions, the desktop app's local sessions and the VS Code extension read the
+same settings.
+
+On Claude Code 2.1.275 or later, one line does both steps:
+
+```
+/plugin install session-dashboard --marketplace ehb54/claude-session-dashboard
+```
+
+It shows the marketplace it resolved and asks you to confirm before adding it.
+Older versions do not know `--marketplace`; use the two lines above.
+
+From a shell, without starting a session:
+
+```
+claude plugin marketplace add ehb54/claude-session-dashboard
+claude plugin install session-dashboard@claude-session-dashboard
+```
+
+This installs at user scope; pass `--scope project` or `--scope local` for
+another. On Claude Code 2.1.292 or later, `claude plugin install
+session-dashboard --marketplace ehb54/claude-session-dashboard` does both
+steps in one.
+
+In the desktop app, where `/plugin` does not run: click **+** next to the
+prompt box, then **Plugins**, **Add marketplace** with
+`ehb54/claude-session-dashboard`, then **Add plugin**. Or install it from a
+terminal at user scope as above.
+
+A session that was already open when you installed picks the plugin up after
+`/reload-plugins`, so a long-running session does not need a restart. New
+sessions load it when they start.
+
+## Use
+
+In the session you want to keep as your dashboard, type:
+
+```
+/session-dashboard
+```
+
+The pane opens beside the conversation. A session that never runs the command
+never opens the pane and never scans.
+
 ## What the pane shows
 
 ```
@@ -68,38 +126,6 @@ Within [1d] [1w] [1M] [all]  [or type 30m, 6h, 2w, 3M] [Set]
 The pane rescans every 30 seconds while it is open, and not at all while it is
 closed. Only files that changed since the last scan are read again.
 
-## Install
-
-At the prompt of a Claude Code terminal session:
-
-```
-/plugin install session-dashboard --marketplace ehb54/claude-session-dashboard
-```
-
-Answer `y` to add the marketplace, then pick a scope (user scope makes it
-available in every session, the desktop app's included).
-
-From a shell:
-
-```
-claude plugin install session-dashboard --marketplace ehb54/claude-session-dashboard
-```
-
-In the desktop app, where `/plugin` does not run: click **+** next to the
-prompt box, then **Plugins**, **Add marketplace** with
-`ehb54/claude-session-dashboard`, then **Add plugin**.
-
-## Use
-
-In the session you want to keep as your dashboard, type:
-
-```
-/session-dashboard
-```
-
-The pane opens beside the conversation. A session that never runs the command
-never opens the pane and never scans.
-
 ## What it reads
 
 Everything stays on your machine. The only thing the mod writes is its own
@@ -150,7 +176,60 @@ opened.
 - A session no lookup returned gets a link built from the shape of the links
   the app did return.
 
+## Update and uninstall
+
+Claude Code auto-updates only its official marketplaces by default, so this
+one stays at the version you installed until you update it. From a shell:
+
+```
+claude plugin marketplace update claude-session-dashboard
+claude plugin update session-dashboard@claude-session-dashboard
+```
+
+Or, in a terminal session, run `/plugin`, open the **Marketplaces** tab,
+select `claude-session-dashboard` and choose **Update marketplace**. The same
+place turns auto-update on. A running session keeps the version it loaded
+until you run `/reload-plugins` in it.
+
+To uninstall:
+
+```
+claude plugin uninstall session-dashboard@claude-session-dashboard
+claude plugin marketplace remove claude-session-dashboard
+```
+
+Removing the marketplace also uninstalls every plugin installed from it, so
+the second line alone does both. In a session the same commands are
+`/plugin uninstall ...` and `/plugin marketplace remove ...`.
+
+## Troubleshooting
+
+- **`/plugin isn't available in this environment`**: you typed `/plugin` in
+  the desktop app's Code tab, or another surface without a terminal. Use a
+  terminal session, a shell, or the desktop app's **+** menu, as under
+  [Install](#install).
+- **`--marketplace` is not accepted**: your Claude Code is older than 2.1.275
+  (2.1.292 for the shell command). Add the marketplace first, then install
+  `session-dashboard@claude-session-dashboard`.
+- **`Plugin "session-dashboard" not found`**: the marketplace has not been
+  added yet, or the `@claude-session-dashboard` suffix is missing.
+- **`/session-dashboard` is not a command**: the session started before the
+  install. Run `/reload-plugins` in it, or start a new session.
+
 ## Develop
+
+Load a working copy into one session without installing it:
+
+```
+claude --plugin-dir .
+```
+
+Claude Code hot-reloads the hooks module whenever a file in it changes. It
+also writes the type definitions for your Claude Code version into
+`.claude-plugin/types/`, which `tsconfig.json` extends and `.gitignore`
+leaves out.
+
+Check and test from a shell:
 
 ```
 claude plugin validate .
@@ -163,6 +242,10 @@ pop-out before the first open, hiding and unhiding, keeping past the cutoff, cho
 across sessions, PRs and issues folding, unfolding and opening, the perl,
 grep and in-memory transcript scans, and the fallback when the app's lookups
 fail.
+
+Installed copies are cached by version, so bump `version` in
+[`.claude-plugin/plugin.json`](.claude-plugin/plugin.json) for every release,
+or `claude plugin update` finds nothing new.
 
 ## License
 
