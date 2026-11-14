@@ -79,6 +79,7 @@ const cutoffAtom = atom({ plugin: 'session-dashboard', key: 'cutoff' } as const,
 const archivedAtom = atom({ plugin: 'session-dashboard', key: 'archived' } as const, false)
 const hiddenAtom = atom({ plugin: 'session-dashboard', key: 'hidden' } as const, [] as string[])
 const showHiddenAtom = atom({ plugin: 'session-dashboard', key: 'showHidden' } as const, false)
+const keptAtom = atom({ plugin: 'session-dashboard', key: 'kept' } as const, [] as string[])
 const expandedAtom = atom({ plugin: 'session-dashboard', key: 'expanded' } as const, [] as string[])
 const filterAtom = atom({ plugin: 'session-dashboard', key: 'filter' } as const, '')
 const statusAtom = atom(
@@ -460,11 +461,27 @@ async function openSession($: Engine, row: Row): Promise<void> {
   }
 }
 
-/** Store keys, kept across sessions: the sort and cutoff chosen, and the sessions hidden. */
+/** Store keys, kept across sessions: the sort and cutoff chosen, the sessions hidden and kept. */
 const PREFS = 'prefs'
 const HIDDEN = 'hidden'
+const KEPT = 'kept'
 
-/** Puts back what the person chose last, in any session: sort, cutoff, hidden sessions. */
+/** A saved list of session ids, or null when what was saved is not one. */
+const idsOf = (value: unknown): string[] | null =>
+  Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : null
+
+const withId = (ids: readonly string[], id: string, add: boolean): string[] =>
+  add ? [...new Set([...ids, id])] : ids.filter(one => one !== id)
+
+async function saveIds($: Engine, key: string, ids: string[]): Promise<void> {
+  try {
+    await $.store.set(key, ids)
+  } catch {
+    // It still holds for this session.
+  }
+}
+
+/** Puts back what the person chose last, in any session: sort, cutoff, hidden and kept sessions. */
 async function loadPrefs($: Engine): Promise<void> {
   try {
     const saved = (await $.store.get(PREFS)) as { sort?: unknown; cutoff?: unknown } | undefined
@@ -476,26 +493,34 @@ async function loadPrefs($: Engine): Promise<void> {
     // Nothing saved, or the store is unreadable: the defaults stand.
   }
   try {
-    const hidden = await $.store.get(HIDDEN)
-    if (Array.isArray(hidden)) {
-      const ids = hidden.filter((id): id is string => typeof id === 'string')
-      await update($, hiddenAtom, () => ids)
-    }
+    const hidden = idsOf(await $.store.get(HIDDEN))
+    if (hidden !== null) await update($, hiddenAtom, () => hidden)
   } catch {
     // Nothing hidden yet.
   }
+  try {
+    const kept = idsOf(await $.store.get(KEPT))
+    if (kept !== null) await update($, keptAtom, () => kept)
+  } catch {
+    // Nothing kept yet.
+  }
 }
 
-/** Hides a session from the list, or shows it again, and remembers that. */
+/** Hides a session from the list, or shows it again, and remembers that. Hiding a kept session lets it go. */
 async function setHidden($: Engine, id: string, hide: boolean): Promise<void> {
-  await update($, hiddenAtom, ids =>
-    hide ? [...new Set([...ids, id])] : ids.filter(one => one !== id),
-  )
-  try {
-    await $.store.set(HIDDEN, await read($, hiddenAtom))
-  } catch {
-    // It still holds for this session.
-  }
+  await update($, hiddenAtom, ids => withId(ids, id, hide))
+  await saveIds($, HIDDEN, await read($, hiddenAtom))
+  if (hide && (await read($, keptAtom)).includes(id)) await setKept($, id, false)
+}
+
+/**
+ * Keeps a session in the list whatever the cutoff, until the person lets it
+ * go, and remembers that. Keeping a hidden session unhides it.
+ */
+async function setKept($: Engine, id: string, keep: boolean): Promise<void> {
+  await update($, keptAtom, ids => withId(ids, id, keep))
+  await saveIds($, KEPT, await read($, keptAtom))
+  if (keep && (await read($, hiddenAtom)).includes(id)) await setHidden($, id, false)
 }
 
 async function savePrefs($: Engine): Promise<void> {
@@ -557,18 +582,21 @@ export const register: Register = on => {
     const status = await read($, statusAtom)
     const cut = parseCutoff(await read($, cutoffAtom)) ?? parseCutoff('1d')!
     const isPreset = (CUTOFF_PRESETS as readonly string[]).includes(cut.spec)
-    const hidden = new Set(await read($, hiddenAtom))
+    const kept = new Set(await read($, keptAtom))
+    // Keeping and hiding exclude each other; should both be saved, keeping wins.
+    const hidden = new Set((await read($, hiddenAtom)).filter(id => !kept.has(id)))
     const showHidden = await read($, showHiddenAtom)
     const expanded = new Set(await read($, expandedAtom))
     const hiddenCount = rows.filter(row => hidden.has(row.id)).length
+    const keptCount = rows.filter(row => kept.has(row.id)).length
     const now = await $.clock.now()
     const visible = filterRows(rows, filter).filter(row => showHidden || !hidden.has(row.id))
-    const shown = sortRows(withinCutoff(visible, sort, cut.ms, now), sort)
+    const shown = sortRows(withinCutoff(visible, sort, cut.ms, now, kept), sort)
     const age = status.updatedAt === null ? null : ago(status.updatedAt, now)
     const head =
       age === null
         ? 'Scanning sessions…'
-        : `${shown.length} of ${rows.length} sessions${cut.ms === null ? '' : ` within ${cut.label}`}${hiddenCount > 0 ? ` · ${hiddenCount} hidden` : ''} · scanned ${age === 'now' ? 'just now' : `${age} ago`} · ● running`
+        : `${shown.length} of ${rows.length} sessions${cut.ms === null ? '' : ` within ${cut.label}`}${keptCount > 0 ? ` · ${keptCount} kept` : ''}${hiddenCount > 0 ? ` · ${hiddenCount} hidden` : ''} · scanned ${age === 'now' ? 'just now' : `${age} ago`} · ● running`
 
     return (
       <Box flexDirection="column">
@@ -625,6 +653,7 @@ export const register: Register = on => {
         {status.error !== null && <Text color="warning">{status.error}</Text>}
         {shown.map(row => {
           const isHidden = hidden.has(row.id)
+          const isKept = kept.has(row.id)
           const isExpanded = expanded.has(row.id)
           const prs = isExpanded ? row.prs : row.prs.slice(0, REF_LIMIT)
           const issues = isExpanded ? row.issues : row.issues.slice(0, REF_LIMIT)
@@ -638,12 +667,19 @@ export const register: Register = on => {
           return (
             <Box key={`row-${row.id}`} flexDirection="column">
               <Button key={row.id} plain onPress={() => void openSession($, row)}>
-                {`${row.isRunning ? '● ' : '  '}${row.title}${row.isSelf ? ' (this session)' : ''}${row.isArchived ? ' (archived)' : ''}${isHidden ? ' (hidden)' : ''}`}
+                {`${row.isRunning ? '● ' : '  '}${row.title}${row.isSelf ? ' (this session)' : ''}${isKept ? ' (kept)' : ''}${row.isArchived ? ' (archived)' : ''}${isHidden ? ' (hidden)' : ''}`}
               </Button>
               <Box flexDirection="row" columnGap={1}>
                 <Text dimColor wrap="truncate-end">
                   {`    ${row.group ?? 'no group'} · you ${ago(touchAt(row), now)} · any ${ago(row.activityAt, now)}`}
                 </Text>
+                <Button
+                  key={`keep-${row.id}`}
+                  plain
+                  dimColor
+                  label={isKept ? 'unkeep' : 'keep'}
+                  onPress={() => void setKept($, row.id, !isKept)}
+                />
                 <Button
                   key={`hide-${row.id}`}
                   plain

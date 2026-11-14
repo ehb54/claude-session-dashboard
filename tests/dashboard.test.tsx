@@ -530,7 +530,7 @@ const startSession = async ($: Parameters<Parameters<typeof test>[1]>[0], on: Pa
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
 }
 
-test('the sort, cutoff and hidden sessions chosen last come back in a new session', async ($, on) => {
+test('the sort, cutoff and hidden and kept sessions chosen last come back in a new session', async ($, on) => {
   mock.clock(on, { now: NOW })
   mock.env(on, { HOME })
   fakeFiles(on)
@@ -538,6 +538,7 @@ test('the sort, cutoff and hidden sessions chosen last come back in a new sessio
   const saved: Record<string, unknown> = {
     prefs: { sort: 'activity', cutoff: '3d' },
     hidden: ['local_c'],
+    kept: ['local_a'],
   }
   fakeStore(on, saved)
   await startSession($, on)
@@ -546,7 +547,9 @@ test('the sort, cutoff and hidden sessions chosen last come back in a new sessio
   await ui.press({ key: 'refresh' })
   expect((await ui.find({ key: 'sort' }))?.props.label).toBe('Sort: last activity')
   expect((await ui.find({ key: 'cutoff' }))?.props.value).toBe('3d')
-  expect(await ui.find({ type: 'Text', text: /2 of 3 sessions within 3 days · 1 hidden/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /2 of 3 sessions within 3 days · 1 kept · 1 hidden/ })).toBeDefined()
+  expect((await ui.find({ key: 'local_a' }))?.text).toMatch(/\(kept\)/)
+  expect((await ui.find({ key: 'keep-local_a' }))?.props.label).toBe('unkeep')
 
   // Each change is saved at once.
   await ui.press({ key: 'sort' })
@@ -563,7 +566,7 @@ test('saved choices that make no sense are ignored', async ($, on) => {
   mock.env(on, { HOME })
   fakeFiles(on)
   quietApp(on)
-  fakeStore(on, { prefs: { sort: 'sideways', cutoff: 'soon' }, hidden: 'local_a' })
+  fakeStore(on, { prefs: { sort: 'sideways', cutoff: 'soon' }, hidden: 'local_a', kept: 'local_c' })
   await startSession($, on)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -571,6 +574,8 @@ test('saved choices that make no sense are ignored', async ($, on) => {
   expect((await ui.find({ key: 'sort' }))?.props.label).toBe('Sort: your last touch')
   expect((await ui.find({ key: 'cutoff-1d' }))?.props.variant).toBe('primary')
   expect((await ui.find({ key: 'show-hidden' }))?.props.label).toBe('Show hidden (0)')
+  expect(await ui.find({ key: 'local_c' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /2 of 3 sessions within 1 day · scanned/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -610,6 +615,72 @@ test('a session can be hidden, shown again under Show hidden, and unhidden', asy
     await ui.press({ key: 'show-hidden' })
     expect(await order()).toEqual(['local_a', 'local_b', 'local_c'])
     await ui.press({ key: 'cutoff-1d' })
+    await ui.unmount()
+  }
+})
+
+test('a kept session stays past the cutoff until let go, and keeping and hiding exclude each other', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.env(on, { HOME })
+  fakeFiles(on)
+  quietApp(on)
+  const saved: Record<string, unknown> = {}
+  fakeStore(on, saved)
+
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await ui.press({ key: 'refresh' })
+    const order = async () =>
+      (await ui.findAll({ type: 'Button' }))
+        .map(one => one.key)
+        .filter(key => key?.startsWith('local_'))
+    // Gamma was last touched 5 days ago: outside a day.
+    expect(await order()).toEqual(['local_a', 'local_b'])
+
+    await ui.press({ key: 'cutoff-all' })
+    expect((await ui.find({ key: 'keep-local_c' }))?.props.label).toBe('keep')
+    await ui.press({ key: 'keep-local_c' })
+    expect(saved.kept).toEqual(['local_c'])
+    await ui.press({ key: 'cutoff-1d' })
+    expect(await order()).toEqual(['local_a', 'local_b', 'local_c'])
+    expect((await ui.find({ key: 'local_c' }))?.text).toMatch(/Gamma task \(kept\)/)
+    expect((await ui.find({ key: 'keep-local_c' }))?.props.label).toBe('unkeep')
+    expect(await ui.find({ type: 'Text', text: /3 of 3 sessions within 1 day · 1 kept · scanned/ })).toBeDefined()
+
+    // It keeps its place in the sort, by either time.
+    await ui.press({ key: 'sort' })
+    expect(await order()).toEqual(['local_b', 'local_a', 'local_c'])
+    await ui.press({ key: 'sort' })
+
+    // The filter still narrows kept sessions (without the app, a title is its id).
+    await ui.input({ key: 'filter', text: 'local_b' })
+    expect(await order()).toEqual(['local_b'])
+    await ui.input({ key: 'filter', text: 'gamma' })
+    expect(await order()).toEqual(['local_c'])
+    await ui.input({ key: 'filter', text: '' })
+
+    // Hiding a kept session lets it go.
+    await ui.press({ key: 'hide-local_c' })
+    expect(saved.kept).toEqual([])
+    expect(saved.hidden).toEqual(['local_c'])
+    expect(await order()).toEqual(['local_a', 'local_b'])
+
+    // Keeping a hidden session unhides it.
+    await ui.press({ key: 'cutoff-all' })
+    await ui.press({ key: 'show-hidden' })
+    expect((await ui.find({ key: 'local_c' }))?.text).toMatch(/\(hidden\)/)
+    await ui.press({ key: 'keep-local_c' })
+    expect(saved.hidden).toEqual([])
+    expect(saved.kept).toEqual(['local_c'])
+    expect((await ui.find({ key: 'local_c' }))?.text).not.toMatch(/\(hidden\)/)
+    await ui.press({ key: 'show-hidden' })
+    await ui.press({ key: 'cutoff-1d' })
+    expect(await order()).toEqual(['local_a', 'local_b', 'local_c'])
+
+    // Only unkeep lets it go.
+    await ui.press({ key: 'keep-local_c' })
+    expect(saved.kept).toEqual([])
+    expect(await order()).toEqual(['local_a', 'local_b'])
     await ui.unmount()
   }
 })

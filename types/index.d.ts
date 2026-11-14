@@ -58,6 +58,8 @@ declare module 'claude-code' {
       hidden: string[]
       /** Whether hidden sessions show anyway, marked. */
       showHidden: boolean
+      /** Ids of the sessions the person keeps in the list whatever the cutoff. */
+      kept: string[]
       /** Ids of the rows showing all their pull requests and issues. */
       expanded: string[]
       filter: string

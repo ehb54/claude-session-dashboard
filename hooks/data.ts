@@ -365,16 +365,21 @@ export function parseCutoff(
   }
 }
 
-/** Rows whose sorted time falls within the cutoff; a row with no time only under `all`. */
+/**
+ * Rows whose sorted time falls within the cutoff; a row with no time only
+ * under `all`. A kept row stays whatever its time.
+ */
 export function withinCutoff(
   rows: readonly Row[],
   key: SortKey,
   cutoffMs: number | null,
   now: number,
+  kept: ReadonlySet<string> = new Set(),
 ): Row[] {
   if (cutoffMs === null) return [...rows]
 
   return rows.filter(row => {
+    if (kept.has(row.id)) return true
     const at = timeFor(row, key)
 
     return at !== null && at >= now - cutoffMs

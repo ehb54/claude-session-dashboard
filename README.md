@@ -17,13 +17,15 @@ last. This pane answers that.
 [Sort: your last touch] [Show archived] [Show hidden (2)] [Refresh] [Pop out]
 Within [1d] [1w] [1M] [all]  [or type 30m, 6h, 2w, 3M] [Set]
 [Filter by title, group, PR or issue]
-12 of 275 sessions within 1 day · 2 hidden · scanned just now · ● running
+13 of 275 sessions within 1 day · 1 kept · 2 hidden · scanned just now · ● running
 ● Build the release scripts
-    infra · you 3m · any 1m  hide
+    infra · you 3m · any 1m  keep  hide
     PRs tools#41 open #38 merged · issues tickets#212 #208 #199 +2 more
   Review the parser change
-    no group · you 2h · any 5h  hide
+    no group · you 2h · any 5h  keep  hide
     PRs parser#17 open
+  Grant renewal figures (kept)
+    writing · you 9d · any 9d  unkeep  hide
 ```
 
 - **One row per session**: title (● when it is running), then its sidebar
@@ -46,14 +48,18 @@ Within [1d] [1w] [1M] [all]  [or type 30m, 6h, 2w, 3M] [Set]
   `y` years. `h`, `d`, `w` and `y` work in either case; `m` and `M` do not, so
   `90m` is ninety minutes and `2M` two months. Decimals work (`1.5h`). With a
   cutoff set, a session with no time at all (never opened, never prompted)
-  shows only under **all**.
+  shows only under **all**, unless you keep it.
 - **Filter** keeps rows whose title, group, PRs or issues contain every word
   you type: `tickets#212` or `#212` finds the sessions on that issue, folded
   ones included.
+- **keep** on a row keeps that session in the list whatever the cutoff, marked
+  "(kept)", in its place in the sort, until you press **unkeep**. The filter
+  and **Show archived** still apply to it. Hiding a kept session lets it go;
+  keeping a hidden one unhides it.
 - **hide** on a row takes that session off the list. **Show hidden (N)** brings
   hidden sessions back, marked "(hidden)", each with **unhide**.
 - **Show archived** adds archived sessions.
-- Your sort, cutoff and hidden sessions are remembered: a dashboard in any
+- Your sort, cutoff, and kept and hidden sessions are remembered: a dashboard in any
   session starts with the choices you made last.
 - **Click a row** to open that session in the main window. The first time,
   the dashboard's own session moves into a pop-out window so the list stays
@@ -97,7 +103,7 @@ never opens the pane and never scans.
 ## What it reads
 
 Everything stays on your machine. The only thing the mod writes is its own
-small store in Claude Code (your sort, cutoff and hidden session ids). It
+small store in Claude Code (your sort, cutoff, and kept and hidden session ids). It
 reads:
 
 - **The desktop app's own session tools** (the `ccd_session_mgmt`,
@@ -153,7 +159,7 @@ claude plugin test .
 
 The tests run the pane on the desktop and terminal surfaces against a fake
 app: sorting both ways, the cutoff presets and typed values, the filter, the
-pop-out before the first open, hiding and unhiding, choices saved and restored
+pop-out before the first open, hiding and unhiding, keeping past the cutoff, choices saved and restored
 across sessions, PRs and issues folding, unfolding and opening, the perl,
 grep and in-memory transcript scans, and the fallback when the app's lookups
 fail.

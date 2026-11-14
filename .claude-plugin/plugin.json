@@ -1,6 +1,6 @@
 {
   "name": "session-dashboard",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A pane listing every Claude Code desktop session across sidebar groups, sorted by your last touch or by last activity, with each session's pull requests and issues; click a row to open it.",
   "author": { "name": "ehb54" },
   "license": "MIT",
